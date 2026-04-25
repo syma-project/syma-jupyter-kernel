@@ -1,11 +1,15 @@
 """Syma Jupyter kernel — communicates with the syma --kernel binary over JSON."""
 
+import base64
 import json
 import logging
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +79,9 @@ class SymaKernel(Kernel):
         "Wolfram Language-inspired, written in Rust."
     )
 
+    FORMATS = ("inputform", "fullform")
+    """Supported output format specifiers."""
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def __init__(self, **kwargs: Any) -> None:
@@ -83,6 +90,7 @@ class SymaKernel(Kernel):
         if self.log is None:
             self.log = logging.getLogger("syma_kernel")
         self._syma_proc: subprocess.Popen | None = None
+        self._output_format: str = "inputform"
         self._start_syma()
 
     def _start_syma(self) -> None:
@@ -113,13 +121,18 @@ class SymaKernel(Kernel):
         allow_stdin: bool = False,
     ) -> dict[str, Any]:
         """Handle ``execute_request`` from the Jupyter frontend."""
-        if not code.strip():
+        stripped = code.strip()
+        if not stripped:
             return {
                 "status": "ok",
                 "execution_count": self.execution_count,
                 "payload": [],
                 "user_expressions": {},
             }
+
+        # Handle %format cell magic
+        if stripped.startswith("%format"):
+            return self._handle_format_magic(stripped)
 
         result = self._eval(code)
 
@@ -138,41 +151,48 @@ class SymaKernel(Kernel):
         output = result.get("output", "")
         value = result.get("value")
 
-        if not silent:
-            # Build display data — start with text/plain
-            display_data: dict[str, dict[str, Any]] = {"text/plain": {}}  # metadata
-            data: dict[str, str] = {}
-
-            if output:
-                data["text/plain"] = output
-
-            # Check for rich output types from the tagged JSON value
-            if value and isinstance(value, dict):
-                tag = value.get("t")
-                if tag == "img":
-                    # Image value — add a placeholder text representation
-                    w = value.get("w", "?")
-                    h = value.get("h", "?")
-                    ct = value.get("c", "?")
-                    data["text/plain"] = (
-                        data.get("text/plain") or f"Image[{w}x{h}, {ct}]"
-                    )
-                elif tag == "list":
-                    # Lists are already rendered in `output` as text
-                    pass
-                elif tag == "assoc":
-                    # Associations rendered via their display string
-                    pass
-
+        # Forward diagnostic messages (warnings, info) to Jupyter stderr stream
+        for msg in result.get("messages", []):
             self.send_response(
                 self.iopub_socket,
-                "execute_result",
-                {
-                    "data": data,
-                    "metadata": {"text/plain": {}},
-                    "execution_count": self.execution_count,
-                },
+                "stream",
+                {"name": "stderr", "text": msg + "\n"},
             )
+
+        if not silent:
+            # Iterate the results array — one entry per expression in the input
+            for entry in result.get("results", []):
+                if entry is None:
+                    continue  # suppressed (e.g. ``expr;``)
+
+                output = entry.get("output", "")
+                value = entry.get("value")
+
+                # Build display data
+                data: dict[str, str] = {}
+
+                if output:
+                    data["text/plain"] = output
+
+                # Check for rich output types from the tagged JSON value
+                if value and isinstance(value, dict):
+                    tag = value.get("t")
+                    if tag == "img":
+                        self._enrich_with_image(value, data)
+                    elif tag == "list":
+                        self._enrich_with_list(value, data)
+                    elif tag == "assoc":
+                        self._enrich_with_assoc(value, data)
+
+                self.send_response(
+                    self.iopub_socket,
+                    "execute_result",
+                    {
+                        "data": data,
+                        "metadata": {"text/plain": {}},
+                        "execution_count": self.execution_count,
+                    },
+                )
 
         return {
             "status": "ok",
@@ -240,7 +260,7 @@ class SymaKernel(Kernel):
             self.log.warning("syma process died, restarting")
             self._start_syma()
 
-        request = json.dumps({"input": code})
+        request = json.dumps({"input": code, "format": self._output_format})
         assert self._syma_proc.stdin is not None
         assert self._syma_proc.stdout is not None
 
@@ -285,3 +305,227 @@ class SymaKernel(Kernel):
         while end < len(code) and (code[end].isalnum() or code[end] in "_?"):
             end += 1
         return code[start:end]
+
+    # ── %format magic ─────────────────────────────────────────────────────────
+
+    def _handle_format_magic(self, line: str) -> dict[str, Any]:
+        """Handle ``%format <inputform|fullform>`` cell magic."""
+        parts = line.split()
+        if len(parts) == 1:
+            # Show current format
+            self.send_response(
+                self.iopub_socket,
+                "execute_result",
+                {
+                    "data": {"text/plain": f"Current output format: {self._output_format}"},
+                    "metadata": {},
+                    "execution_count": self.execution_count,
+                },
+            )
+        elif len(parts) == 2 and parts[1] in self.FORMATS:
+            self._output_format = parts[1]
+            self.send_response(
+                self.iopub_socket,
+                "execute_result",
+                {
+                    "data": {"text/plain": f"Output format set to: {self._output_format}"},
+                    "metadata": {},
+                    "execution_count": self.execution_count,
+                },
+            )
+        else:
+            return {
+                "status": "error",
+                "execution_count": self.execution_count,
+                "ename": "SymaError",
+                "evalue": f"Unknown format '{parts[1] if len(parts) > 1 else ''}'. "
+                f"Supported: {', '.join(self.FORMATS)}",
+                "traceback": [],
+            }
+
+        return {
+            "status": "ok",
+            "execution_count": self.execution_count,
+            "payload": [],
+            "user_expressions": {},
+        }
+
+    # ── Rich output helpers ───────────────────────────────────────────────────
+
+    def _enrich_with_image(self, value: dict[str, Any], data: dict[str, str]) -> None:
+        """Render a tagged ``img`` value.
+
+        When syma includes inline pixel data (``d``) as a base64-encoded PNG
+        it is set under ``image/png`` so Jupyter renders it inline.
+
+        Otherwise the ``output`` string (``NumericArray[...]``) is parsed
+        and a PNG is generated on the kernel side using built-in modules.
+        """
+        img_data = value.get("d", "")
+        cs = value.get("cs", "")
+        w = value.get("w")
+        h = value.get("h")
+
+        # Build a human-readable fallback
+        dims = f"[{w}x{h}]" if w and h else ""
+        label = "Image"
+        if cs:
+            label += f", {cs}"
+        data.setdefault("text/plain", f"{label}{dims}")
+
+        # Inline base64 image data (provided by syma)
+        if img_data:
+            data["image/png"] = img_data
+            return
+
+        # No inline data — try to generate PNG from the output string
+        output = data.get("text/plain", "")
+        if output and w and h:
+            pixels = self._parse_img_pixels(output)
+            if pixels is not None:
+                mode = "L" if cs.lower() == "grayscale" else "RGB"
+                b64 = self._make_png(w, h, pixels, mode)
+                data["image/png"] = b64
+
+    def _enrich_with_list(self, value: dict[str, Any], data: dict[str, str]) -> None:
+        """Add HTML rendering for a tagged ``list`` value.
+
+        Expected JSON structure from syma:
+          { "t": "list", "items": [...] }
+        """
+        items = value.get("items", [])
+        html = self._render_list_html(items)
+        if html:
+            data["text/html"] = html
+
+    def _enrich_with_assoc(self, value: dict[str, Any], data: dict[str, str]) -> None:
+        """Add HTML table rendering for a tagged ``assoc`` value.
+
+        Expected JSON structure from syma:
+          { "t": "assoc", "keys": [...], "values": [...] }
+        """
+        keys = value.get("keys", [])
+        vals = value.get("values", [])
+        html = self._render_assoc_html(keys, vals)
+        if html:
+            data["text/html"] = html
+
+    def _render_list_html(self, items: list) -> str:
+        """Render a list as indented HTML."""
+        if not items:
+            return ""
+        parts = ["<pre style='margin: 0;'>{"]
+        for item in items:
+            parts.append(f"  {self._escape_html(str(item))},")
+        parts.append("}</pre>")
+        return "\n".join(parts)
+
+    def _render_assoc_html(self, keys: list, vals: list) -> str:
+        """Render an association as an HTML table."""
+        if not keys:
+            return ""
+        parts = [
+            "<table style='border-collapse: collapse; border: 1px solid #ccc;'>"
+        ]
+        for k, v in zip(keys, vals):
+            parts.append(
+                "<tr>"
+                f"<td style='padding: 2px 12px; font-weight: bold; "
+                f"border: 1px solid #ddd; white-space: nowrap;'>"
+                f"{self._escape_html(str(k))}</td>"
+                f"<td style='padding: 2px 12px; border: 1px solid #ddd;'>"
+                f"{self._escape_html(str(v))}</td>"
+                "</tr>"
+            )
+        parts.append("</table>")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _escape_html(s: str) -> str:
+        """Escape HTML special characters."""
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # ── Image rendering helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_img_pixels(output: str) -> list[int] | None:
+        """Parse pixel values from an MMA-formatted ``NumericArray`` in *output*.
+
+        Handles both 2-D (grayscale) and 3-D (RGB) arrays with ``Real32``
+        values.  Returns a flat ``[0..255]`` byte list in row-major order.
+        """
+        m = re.search(r"NumericArray\[(.+?),\s*\"[^\"]*\"\]", output, re.DOTALL)
+        if not m:
+            return None
+
+        # Convert MMA ``{…}`` lists to JSON ``[…]`` and parse
+        try:
+            arr = json.loads(m.group(1).replace("{", "[").replace("}", "]"))
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+        if not isinstance(arr, list) or not arr:
+            return None
+
+        # Flatten and scale ``[0, 1]`` floats to ``[0, 255]`` bytes
+        def _to_byte(v: float) -> int:
+            return max(0, min(255, round(v * 255)))
+
+        pixels: list[int] = []
+
+        # Determine depth: first element of first row
+        first = arr[0]
+        if isinstance(first, list) and first and isinstance(first[0], list):
+            # 3-D RGB array:  arr[row][col][channel]
+            for row in arr:
+                for col in row:
+                    for ch in col:
+                        pixels.append(_to_byte(ch))
+        elif isinstance(first, list):
+            # 2-D grayscale array:  arr[row][col]
+            for row in arr:
+                for val in row:
+                    pixels.append(_to_byte(val))
+        else:
+            return None
+
+        return pixels
+
+    @staticmethod
+    def _make_png(w: int, h: int, pixels: list[int], mode: str) -> str:
+        """Generate a base64-encoded PNG from raw *pixels* (no Pillow needed).
+
+        *mode* is ``"L"`` (grayscale, 1 byte/pixel) or ``"RGB"`` (3 bytes/pixel).
+        """
+        bpp = 1 if mode == "L" else 3
+        stride = w * bpp
+
+        sig = b"\x89PNG\r\n\x1a\n"
+
+        # IHDR chunk
+        color_type = 0 if mode == "L" else 2
+        ihdr_data = struct.pack(">IIBBBBB", w, h, 8, color_type, 0, 0, 0)
+        crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
+        ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", crc)
+
+        # IDAT chunk — raw rows with filter-byte-per-scanline
+        raw = bytearray()
+        for y in range(h):
+            raw.append(0)  # filter: None
+            start = y * stride
+            raw.extend(pixels[start : start + stride])
+
+        compressed = zlib.compress(bytes(raw))
+        crc = zlib.crc32(b"IDAT" + compressed) & 0xFFFFFFFF
+        idat = (
+            struct.pack(">I", len(compressed))
+            + b"IDAT"
+            + compressed
+            + struct.pack(">I", crc)
+        )
+
+        # IEND chunk
+        crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
+        iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", crc)
+
+        return base64.b64encode(sig + ihdr + idat + iend).decode("ascii")

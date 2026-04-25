@@ -1,3 +1,6 @@
+anaconda_projects/
+.ipynb_checkpoints/
+
 .claude/
 
 # gui (Tauri frontend, deprecated)
